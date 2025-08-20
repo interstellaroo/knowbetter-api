@@ -1,5 +1,9 @@
 from fastapi import APIRouter
-from app.schemas.url_input import UrlInputSchema
+from app.schemas.inputs import UrlInputSchema
+from app.services.article import process_article
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix='/article',
@@ -7,6 +11,6 @@ router = APIRouter(
 )
 
 @router.post("/process")
-async def article_process(url: UrlInputSchema):
-    print(url)
-    return {"lol": "lol"}
+async def article_process(input: UrlInputSchema):
+    logger.info(f"Article processing for: {str(input.url)}")
+    return await process_article(str(input.url))
