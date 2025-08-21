@@ -16,12 +16,12 @@ class SentenceData(BaseModel):
     index: int
     sentence: str
     context: str
-
+    paragraph: str
 
 class SplittingData(BaseModel):
     sentences: List[SentenceData]
     count: int
 
-class ArticleProcessingData(BaseModel):
+class ArticleExtractionData(BaseModel):
     article: ArticleData
     data: SplittingData

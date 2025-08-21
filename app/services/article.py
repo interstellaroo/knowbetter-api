@@ -1,31 +1,133 @@
-from newspaper import Article
-from app.schemas.article import ArticleData
-from bs4 import BeautifulSoup
-from typing import List
-import spacy
 import logging
+import spacy
+from newspaper import Article
+from typing import List, Dict, Any
+from bs4 import BeautifulSoup
+import trafilatura
+from app.schemas.article import ArticleData, SentenceData, SplittingData, ArticleExtractionData
+import re
 
+
+logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
-logger = logging.getLogger(__name__) 
 
-def extract_article(url: str) -> ArticleData:
-    """Extracts the article from the provided URL using newspaper4k library.
+def _normalize_whitespace(text: str) -> str:
+    """Helper function for normalizing whitespace in the text.
 
     Args:
-        url (str): The URL of the article to extract
-
-    Raises:
-        Exception: If there is an error during article extraction generic error is thrown
+        text (str): The text to normalize.
 
     Returns:
-        ArticleData: The extracted article data
+        str: The normalized text.
+    """
+    if not text:
+        return ""
+    
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'")
+    return re.sub(r"\s+", " ", text).strip()
+
+def get_paragraphs(url: str, html: str) -> List[str]:
+    """Extracting paragraphs from the article HTML content using trafilatura. Can fallback to downloading the article straight from the
+    provided URL address. 
+
+    Args:
+        url (str): The URL of the article.
+        html (str): The HTML content of the article.
+
+    Returns:
+        List[str]: A list of extracted paragraphs.
+    Raises:
+        ValueError: If no content is downloaded from the URL.
+        ValueError: If no TEI content is extracted from the URL.
+        Exception: If an error occurs while processing the article.
+
+    Returns:
+        List[str]: A list of extracted paragraphs.
+    """
+    try:
+        downloaded = html if html else trafilatura.fetch_url(url)
+        if not downloaded:
+            logger.warning("Failed to download article content from %s", url)
+            raise ValueError("No content downloaded from the URL")
+
+        tei = trafilatura.extract(
+            downloaded,
+            output_format="xml",
+            include_comments=False,
+            include_images=False,
+            include_tables=False,
+            with_metadata=False,
+        )
+        
+        if not tei:
+            logger.warning("No TEI content extracted from %s", url)
+            raise ValueError("No TEI content extracted from the URL")
+        
+        soup = BeautifulSoup(tei, "xml")
+        paragraphs = [_normalize_whitespace(p.get_text(" ", strip=True)) for p in soup.find_all("p")]
+        
+        return paragraphs
+
+    except Exception as e:
+        logger.exception("Error getting paragraphs from %s: %s", url, e)
+        raise Exception(f"Failed to get paragraphs: {e}")
+
+def split_sentences(paragraphs: List[str]) -> List[Dict[str, Any]]:
+    """Splits paragraphs into sentences and extracts contextual information.
+
+    Args:
+        paragraphs (List[str]): A list of paragraphs to split.
+
+    Returns:
+        List[Dict[str, Any]]: A list of sentence records with contextual information.
+    """
+    records: List[Dict[str, Any]] = []
+    index = 0
+    
+    for p_index, paragraph in enumerate(paragraphs):
+        if not paragraph.strip():
+            continue
+        
+        doc = nlp(paragraph)
+        sents = [s.text.strip() for s in doc.sents if s.text.strip()]
+        
+        for sent in sents:
+            records.append({
+                "index": index,
+                "sentence": sent,
+                "paragraph": paragraph,
+                "context": None,
+            })
+            index += 1
+    
+    for i in range(len(records)):
+        prev_s = records[i - 1]["sentence"] if i > 0 else ""
+        cur_s = records[i]["sentence"]
+        next_s = records[i + 1]["sentence"] if i < len(records) - 1 else ""
+        records[i]["context"] = _normalize_whitespace(f"{prev_s} {cur_s} {next_s}")
+
+    return records
+        
+
+def extract_article(url: str) -> ArticleData:
+    """Extracts article metadata and content from the given URL.
+
+    Args:
+        url (str): The URL of the article.
+
+    Raises:
+        Exception: If an error occurs while extracting the article.
+
+    Returns:
+        ArticleData: The extracted article data.
     """
     try:
         article = Article(url)
         article.download()
         article.parse()
         article.nlp()
-        paragraphs = get_article_paragraphs(article.html)
+        
+        paragraphs = get_paragraphs(url, article.html)
         
         result = ArticleData(
             url=url,
@@ -34,119 +136,75 @@ def extract_article(url: str) -> ArticleData:
             text=article.text,
             publish_date=article.publish_date,
             summary=article.summary,
-            paragraphs=paragraphs
+            paragraphs=paragraphs,
         )
-        logger.info("Article extraction completed successfully")
+        logger.info("Successfully extracted article from %s", url)
+        return result
+    
+    except Exception as e:
+        logger.exception("Error extracting article from %s: %s", url, e)
+        raise Exception(f"Article extraction failed: {e}")
+
+
+async def create_processing_data(article_data: ArticleData) -> SplittingData:
+    """Creates processing data for the article by splitting its paragraphs into sentences.
+
+    Args:
+        article_data (ArticleData): The article data to process.
+
+    Raises:
+        Exception: If an error occurs while creating processing data.
+
+    Returns:
+        SplittingData: The created processing data.
+    """
+    try:
+        records = split_sentences(article_data.paragraphs)
+
+        sentences = [
+            SentenceData(
+                index=rec["index"],
+                sentence=rec["sentence"],
+                context=rec["context"],
+                paragraph=rec["paragraph"],
+            )
+            for rec in records
+        ]
+
+        result = SplittingData(
+            sentences=sentences,
+            count=len(sentences)
+        )
+
+        logger.info("Successfully created processing data for article: %s", article_data.url)
         return result
 
     except Exception as e:
-        logger.error(f"Error in extract_article: {e}")
-        raise Exception(f"Article extraction failed: {str(e)}")
+        logger.exception("Error creating processing data for article: %s", e)
+        raise Exception(f"Failed to create processing data: {e}")
 
-def get_article_paragraphs(html: str) -> List[str]:
-    """Extracts paragraphs from the article HTML.
+
+async def process_article(url: str) -> ArticleExtractionData:
+    """Processes the article at the given URL and extracts relevant data.
 
     Args:
-        html (str): The HTML content of the article
+        url (str): The URL of the article to process.
 
     Raises:
-        Exception: If there is an error during paragraph extraction
+        Exception: If an error occurs while processing the article.
 
     Returns:
-        List[str]: List of the extracted paragraphs
+        ArticleExtractionData: The extracted article data.
     """
-    try:
-        soup = BeautifulSoup(html, 'html.parser')
-        paragraphs = [p.get_text().strip() for p in soup.find_all("p")]
-        return paragraphs
-    except Exception as e:
-        logger.error(f"Error extracting paragraphs: {e}")
-        raise Exception(f"Failed to extract paragraphs: {str(e)}")
-
-def split_into_sentences(article_text: str) -> List[str]:
-    """Splitting entire article text into individual sentences with spacy
-
-    Args:
-        article_text (str): The full text of the article
-
-    Raises:
-        Exception: If there is an error during sentence splitting
-
-    Returns:
-        List[str]: List of the individual sentences
-    """
-    try:
-        doc = nlp(article_text)
-        sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-        return sentences
-    except Exception as e:
-        logger.error(f"Error splitting sentences: {e}")
-        raise Exception(f"Failed to split sentences: {str(e)}")
-
-def get_context(index: int, sentences: List[str]) -> str:
-    """Creates the context for each sentence. The context consists of i - 1 and i + 1 sentences.
-
-    Args:
-        index (int): The index of the current sentence
-        sentences (List[str]): The list of all sentences
-
-    Returns:
-        context (str): The context for the current sentence
-    """
-    previous = sentences[index - 1] if index > 0 else ""
-    current = sentences[index]
-    next = sentences[index + 1] if index < len(sentences) - 1 else ""
-    context = f"{previous} {current} {next}".strip()
-    return context
-
-def match_paragraph(paragraphs: List[str], sentence: str) -> str:
-    """Matches the sentence to the article paragraph. Later the paragraph is provided as an extended context during sentence processing.
-
-    Args:
-        paragraphs (List[str]): _description_
-        sentence (str): _description_
-
-    Returns:
-        str: _description_
-    """
-    sentence = sentence.strip().replace("\n", "")
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip().replace("\n", "")
-        if sentence and sentence in paragraph:
-            return paragraph
-    return "Not found"
-
-async def create_processing_data(article_data: ArticleData):
-    try:
-        logger.info("Creating processing data...")
-        sentences = split_into_sentences(article_data.text)
-        
-        processed_sentences = []
-        for i, sentence in enumerate(sentences):
-            context = get_context(i, sentences)
-            paragraph = match_paragraph(article_data.paragraphs, sentence)
-            processed_sentences.append({
-                "index": i,
-                "sentence": sentence,
-                "context": context,
-                "paragraph": paragraph
-            })
-        
-        logger.info("Processing data created successfully")
-        return processed_sentences
-    except Exception as e:
-        logger.error(f"Error creating processing data: {e}")
-        raise
-
-async def process_article(url: str):
     try:
         article = extract_article(url)
-        sentences_data = await create_processing_data(article)
-        
-        return {
-            "article": article,
-            "sentences": sentences_data
-        }
+        splitting_data = await create_processing_data(article)
+
+        return ArticleExtractionData(
+            article=article,
+            data=splitting_data
+        )
+
     except Exception as e:
-        logger.error(f"Error in process_article: {e}")
-        raise
+        logger.exception("Error processing article from %s: %s", url, e)
+        raise Exception(f"Article processing failed: {e}")
