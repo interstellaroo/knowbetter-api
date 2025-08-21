@@ -5,6 +5,7 @@ from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 import trafilatura
 from app.schemas.article import ArticleData, SentenceData, SplittingData, ArticleExtractionData
+from app.services.llm import select_sentences, disambiguate_sentences
 import re
 
 
@@ -140,7 +141,6 @@ def extract_article(url: str) -> ArticleData:
         )
         logger.info("Successfully extracted article from %s", url)
         return result
-    
     except Exception as e:
         logger.exception("Error extracting article from %s: %s", url, e)
         raise Exception(f"Article extraction failed: {e}")
@@ -208,3 +208,16 @@ async def process_article(url: str) -> ArticleExtractionData:
     except Exception as e:
         logger.exception("Error processing article from %s: %s", url, e)
         raise Exception(f"Article processing failed: {e}")
+
+async def run_article_processing(url: str):
+    try:
+        article_data = await process_article(url)
+        logger.info("Extracted %d sentences from article", article_data.data.count)
+        
+        selection_results = await select_sentences(article_data.data)
+        disambiguation_results = await disambiguate_sentences(selection_results, article_data.data)
+
+        return disambiguation_results
+    except Exception as e:
+        logger.error(f"Error processing article: {str(e)}")
+        raise Exception(f"Failed to process article: {str(e)}")
