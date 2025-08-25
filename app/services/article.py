@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 import trafilatura
 from app.schemas.article import ArticleData, SentenceData, SplittingData, ArticleExtractionData
-from app.services.llm import select_sentences, disambiguate_sentences
+from app.services.llm import select_sentences, disambiguate_sentences, decompose_sentences
 import re
 
 
@@ -216,8 +216,9 @@ async def run_article_processing(url: str):
         
         selection_results = await select_sentences(article_data.data)
         disambiguation_results = await disambiguate_sentences(selection_results, article_data.data)
+        decomposition_results = await decompose_sentences(disambiguation_results)
 
-        return disambiguation_results
+        return decomposition_results
     except Exception as e:
         logger.error(f"Error processing article: {str(e)}")
         raise Exception(f"Failed to process article: {str(e)}")

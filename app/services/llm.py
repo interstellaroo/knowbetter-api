@@ -1,10 +1,9 @@
 import ollama
 import asyncio
 from typing import List
-from app.core.prompts import SelectionPrompts, DisambiguationPrompts
-from app.schemas.article import SplittingData, SelectionResult, DisambiguationResult
+from app.core.prompts import SelectionPrompts, DisambiguationPrompts, DecompositionPrompts
+from app.schemas.article import SplittingData, SelectionResult, DisambiguationResult, DecompositionResult
 
-# Initialize Ollama client
 client = ollama.AsyncClient()
 
 
@@ -62,7 +61,50 @@ async def _disambiguate_sentence(selection_result: SelectionResult, sentence_dat
             disambiguated_sentence=selection_result.rewritten_sentence,
             reason=str(e)
         )
-    
+
+async def _decompose_sentence(disambiguation_result: DisambiguationResult) -> DecompositionResult:
+    try:
+        prompt = DecompositionPrompts.get_prompt(claim=disambiguation_result.disambiguated_sentence)
+        
+        response = await client.chat(
+            model="mistral",
+            messages=[
+                {"role": "system", "content": DecompositionPrompts.GUIDELINES},
+                {"role": "user", "content": prompt},
+            ],
+            format=DecompositionResult.model_json_schema(),
+            stream=False,
+            options={"temperature": 0.0},
+        )
+        
+        result = DecompositionResult.model_validate_json(response.message.content)
+        return result
+    except Exception as e:
+        return DecompositionResult(
+            original_claim=disambiguation_result.disambiguated_sentence,
+            decomposed_claims=[],
+        )
+
+async def decompose_sentences(disambiguation_results: List[DisambiguationResult]) -> List[DecompositionResult]:
+    """
+    Process disambiguated sentences and decompose them into individual verifiable claims.
+
+    Args:
+        disambiguation_results (List[DisambiguationResult]): The disambiguated sentences to decompose
+
+    Returns:
+        List[DecompositionResult]: List of decomposed claims for each sentence
+    """
+    try:
+        tasks = []
+        for disambiguation_result in disambiguation_results:
+            task = _decompose_sentence(disambiguation_result)
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks)
+        return results
+    except Exception as e:
+        raise e
 
 async def disambiguate_sentences(selection_results: List[SelectionResult], data: SplittingData) -> List[DisambiguationResult]:
     try:

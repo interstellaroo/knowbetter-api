@@ -35,6 +35,10 @@ class DisambiguationResult(BaseModel):
     disambiguated_sentence: str
     reason: str
 
+class DecompositionResult(BaseModel):
+    original_claim: str
+    decomposed_claims: List[str]
+
 class ArticleExtractionData(BaseModel):
     article: ArticleData
     data: SplittingData
