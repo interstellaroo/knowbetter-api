@@ -19,11 +19,9 @@ class SentenceData(BaseModel):
     context: str
     paragraph: str
 
-
 class SplittingData(BaseModel):
     sentences: List[SentenceData]
     count: int
-
 
 class SelectionResult(BaseModel):
     original_sentence: str

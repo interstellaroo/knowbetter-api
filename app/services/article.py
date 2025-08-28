@@ -7,10 +7,15 @@ from app.schemas.article import ArticleData, SentenceData, SplittingData, Articl
 from newspaper.exceptions import ArticleBinaryDataException
 from app.services.llm import select_sentences, disambiguate_sentences, decompose_sentences
 from app.services.retrieve import process_decomposition_evidence
-from app.services.verify import process_evidence_verification 
+from app.services.verify import process_evidence_verification
+from app.schemas.verify import FinalValidationResult, ProcessingStatistics, PipelineStepResults, ArticleSummary, VerdictSummary 
 import re
 from urllib.parse import urlparse
 import logging
+from datetime import datetime
+from typing import Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models import VerificationRun, Sentence, Selection, Disambiguation, Decomposition, Claim, Evidence, Verification
 
 logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
@@ -150,7 +155,7 @@ def extract_article(url: str) -> ArticleData:
     except ArticleBinaryDataException as e:
         raise
     except Exception as e:
-        raise Exception(f"Article extraction failed: {e}")
+        raise Exception(f"Article extraction failed. The website might be protected.")
 
 def get_domain(url: str) -> str:
     try:
@@ -231,9 +236,11 @@ async def process_article(url: str) -> ArticleExtractionData:
         raise 
     except Exception as e:
         logger.exception("Error processing article from %s: %s", url, e)
-        raise Exception(f"Article processing failed")
+        raise Exception(f"Article processing failed.")
 
-async def run_article_processing(url: str):
+async def run_article_processing(url: str, db: Optional[AsyncSession] = None) -> FinalValidationResult:
+    processing_start = datetime.now()
+    
     try:
         article_data = await process_article(url)
         logger.info("Extracted %d sentences from article", article_data.data.count)
@@ -249,29 +256,282 @@ async def run_article_processing(url: str):
         total_claims = sum(len(result.decomposed_claims) for result in decomposition_results)
         logger.info(f"Decomposition complete: {len(decomposition_results)} sentences produced {total_claims} total claims")
         
+        evidence_results = None
+        verification_results = None
+        claims_with_evidence = 0
+        verified_claims = 0
+        
         if decomposition_results and total_claims > 0:
             evidence_results = await process_decomposition_evidence(decomposition_results, article_data.article.domain)
-            logger.info(f"Evidence retrieval complete: {len(evidence_results.evidence)} evidence results")
+            claims_with_evidence = len([e for e in evidence_results.evidence if e.evidence])
+            logger.info(f"Evidence retrieval complete: {claims_with_evidence}/{len(evidence_results.evidence)} claims have evidence")
             
             # Verify claims against evidence
             if evidence_results.evidence:
                 verification_results = await process_evidence_verification([evidence_results])
-                logger.info(f"Verification complete: {verification_results.total_processed} claims verified in {verification_results.processing_time:.2f}s")
-                return verification_results
+                verified_claims = verification_results.total_processed
+                logger.info(f"Verification complete: {verified_claims} claims verified in {verification_results.processing_time:.2f}s")
             else:
                 logger.warning("No evidence found for verification")
-                return evidence_results
         else:
             logger.warning("No claims found for evidence retrieval")
-            evidence_results = []
 
-        return evidence_results
+        processing_end = datetime.now()
+        total_processing_time = (processing_end - processing_start).total_seconds()
+        
+        final_result = _build_final_validation_result(
+            article_data=article_data,
+            selection_results=selection_results,
+            disambiguation_results=disambiguation_results,
+            decomposition_results=decomposition_results,
+            evidence_results=evidence_results,
+            verification_results=verification_results,
+            processing_start=processing_start,
+            processing_end=processing_end,
+            total_processing_time=total_processing_time,
+            verifiable_count=verifiable_count,
+            total_claims=total_claims,
+            claims_with_evidence=claims_with_evidence,
+            verified_claims=verified_claims
+        )
+        if db:
+            await _save_to_database(db, final_result)
+            
+        return final_result
+        
     except ArticleBinaryDataException:
         logger.warning("Binary data detected during article processing for %s", url)
-        raise  # Re-raise to preserve exception type for route handler
+        raise
     except Exception as e:
         logger.error(f"Error processing article: {str(e)}")
-        raise Exception(f"Failed to process article: {str(e)}")
+        raise
+
+def _build_final_validation_result(
+    article_data: ArticleExtractionData,
+    selection_results: List,
+    disambiguation_results: List,
+    decomposition_results: List,
+    evidence_results: Optional[Any],
+    verification_results: Optional[Any],
+    processing_start: datetime,
+    processing_end: datetime,
+    total_processing_time: float,
+    verifiable_count: int,
+    total_claims: int,
+    claims_with_evidence: int,
+    verified_claims: int
+) -> FinalValidationResult:
+    """Build the final validation result from all pipeline components."""
+    
+    # Create article summary
+    article_summary = ArticleSummary(
+        url=article_data.article.url,
+        title=article_data.article.title,
+        domain=article_data.article.domain,
+        authors=article_data.article.authors,
+        publish_date=article_data.article.publish_date
+    )
+    
+    # Create processing statistics
+    statistics = ProcessingStatistics(
+        total_sentences=article_data.data.count,
+        verifiable_sentences=verifiable_count,
+        disambiguated_sentences=len(disambiguation_results),
+        total_claims=total_claims,
+        claims_with_evidence=claims_with_evidence,
+        verified_claims=verified_claims,
+        processing_time_seconds=total_processing_time
+    )
+    
+    # Create pipeline results
+    pipeline_results = PipelineStepResults(
+        selection_results=selection_results,
+        disambiguation_results=disambiguation_results,
+        decomposition_results=decomposition_results,
+        evidence_results=evidence_results,
+        verification_results=verification_results
+    )
+    
+    # Calculate verdict summary
+    verdict_summary = _calculate_verdict_summary(verification_results, total_claims, claims_with_evidence)
+    
+    return FinalValidationResult(
+        article=article_summary,
+        statistics=statistics,
+        pipeline_results=pipeline_results,
+        verdict_summary=verdict_summary,
+        processing_start=processing_start,
+        processing_end=processing_end,
+        total_processing_time=total_processing_time
+    )
+
+def _calculate_verdict_summary(verification_results: Optional[Any], total_claims: int, claims_with_evidence: int) -> VerdictSummary:
+    """Calculate the verdict summary from verification results."""
+    if not verification_results or not verification_results.results:
+        return VerdictSummary(
+            entailed_claims=0,
+            contradicted_claims=0,
+            neutral_claims=0,
+            unsupported_claims=total_claims,
+            overall_credibility_score=0.0
+        )
+    
+    # Count verdicts
+    entailed = sum(1 for r in verification_results.results if r.verdict == "ENTAILMENT")
+    contradicted = sum(1 for r in verification_results.results if r.verdict == "CONTRADICTION")
+    neutral = sum(1 for r in verification_results.results if r.verdict == "NEUTRAL")
+    unsupported = total_claims - claims_with_evidence
+    
+    # Calculate overall credibility score (0-1 scale)
+    if total_claims == 0:
+        credibility_score = 0.0
+    else:
+        # Weight: ENTAILMENT = +1, NEUTRAL = 0, CONTRADICTION = -1, UNSUPPORTED = -0.5
+        weighted_score = (entailed * 1.0) + (neutral * 0.0) + (contradicted * -1.0) + (unsupported * -0.5)
+        max_possible_score = total_claims * 1.0
+        min_possible_score = total_claims * -1.0
+        
+        # Normalize to 0-1 scale
+        if max_possible_score == min_possible_score:
+            credibility_score = 0.5
+        else:
+            credibility_score = (weighted_score - min_possible_score) / (max_possible_score - min_possible_score)
+    
+    return VerdictSummary(
+        entailed_claims=entailed,
+        contradicted_claims=contradicted,
+        neutral_claims=neutral,
+        unsupported_claims=unsupported,
+        overall_credibility_score=round(credibility_score, 3)
+    )
+
+async def _save_to_database(db: AsyncSession, result: FinalValidationResult):
+    """Save verification run to database with normalized structure."""
+    try:
+        # 1. Create main verification run
+        verification_run = VerificationRun(
+            url=result.article.url,
+            title=result.article.title,
+            domain=result.article.domain,
+            authors=result.article.authors,
+            publish_date=result.article.publish_date,
+            processing_start=result.processing_start,
+            processing_end=result.processing_end,
+            total_processing_time=result.total_processing_time,
+            status="completed",
+            overall_credibility_score=result.verdict_summary.overall_credibility_score
+        )
+        
+        db.add(verification_run)
+        await db.flush()  # Get ID without committing
+        run_id = verification_run.id
+        
+        # 2. Save sentences
+        if result.pipeline_results.selection_results:
+            for i, sentence_data in enumerate(result.pipeline_results.selection_results):
+                sentence = Sentence(
+                    run_id=run_id,
+                    index=i,
+                    sentence=sentence_data.original_sentence,
+                    context=None,
+                    paragraph=None
+                )
+                db.add(sentence)
+        
+        # 3. Save selections
+        if result.pipeline_results.selection_results:
+            for selection_data in result.pipeline_results.selection_results:
+                selection = Selection(
+                    run_id=run_id,
+                    original_sentence=selection_data.original_sentence,
+                    verification_label=selection_data.verification_label,
+                    rewritten_sentence=selection_data.rewritten_sentence
+                )
+                db.add(selection)
+        
+        # 4. Save disambiguations
+        if result.pipeline_results.disambiguation_results:
+            for disambig_data in result.pipeline_results.disambiguation_results:
+                disambiguation = Disambiguation(
+                    run_id=run_id,
+                    original_sentence=disambig_data.original_sentence,
+                    disambiguated_sentence=disambig_data.disambiguated_sentence,
+                    reason=disambig_data.reason
+                )
+                db.add(disambiguation)
+        
+        # 5. Save decompositions and claims
+        claim_id_map = {}
+        
+        if result.pipeline_results.decomposition_results:
+            for decomp_data in result.pipeline_results.decomposition_results:
+                decomposition = Decomposition(
+                    run_id=run_id,
+                    original_claim=decomp_data.original_claim,
+                    decomposed_claims=decomp_data.decomposed_claims
+                )
+                db.add(decomposition)
+                await db.flush()
+                
+                # Save individual claims
+                for i, claim_text in enumerate(decomp_data.decomposed_claims):
+                    claim = Claim(
+                        run_id=run_id,
+                        decomposition_id=decomposition.id,
+                        claim_text=claim_text,
+                        claim_index=i
+                    )
+                    db.add(claim)
+                    await db.flush()
+                    claim_id_map[claim_text] = claim.id
+        
+        # 6. Save evidence
+        if result.pipeline_results.evidence_results and result.pipeline_results.evidence_results.evidence:
+            for evidence_result in result.pipeline_results.evidence_results.evidence:
+                claim_text = evidence_result.claim
+                claim_id = claim_id_map.get(claim_text)
+                
+                if claim_id:
+                    for evidence_item in evidence_result.evidence:
+                        evidence = Evidence(
+                            run_id=run_id,
+                            claim_id=claim_id,
+                            title=evidence_item.title,
+                            link=evidence_item.link,
+                            snippet=evidence_item.snippet,
+                            display_link=evidence_item.displayLink,
+                            retrieved_at=evidence_result.timestamp
+                        )
+                        db.add(evidence)
+        
+        # 7. Save verifications
+        if result.pipeline_results.verification_results and result.pipeline_results.verification_results.results:
+            for verification_result in result.pipeline_results.verification_results.results:
+                claim_text = verification_result.claim
+                claim_id = claim_id_map.get(claim_text)
+                
+                if claim_id:
+                    verification = Verification(
+                        run_id=run_id,
+                        claim_id=claim_id,
+                        claim_text=verification_result.claim,
+                        evidence_summary=verification_result.evidence_summary,
+                        evidence_source=verification_result.evidence_source,
+                        verdict=verification_result.verdict,
+                        confidence=verification_result.confidence,
+                        scores=verification_result.scores,
+                        timestamp=verification_result.timestamp
+                    )
+                    db.add(verification)
+        
+        # Commit all changes
+        await db.commit()
+        logger.info(f"Saved verification run {verification_run.id} to database")
+        
+    except Exception as e:
+        logger.error(f"Failed to save to database: {e}")
+        await db.rollback()
+        raise
 
 async def get_article_summary(url: str):
     try:
