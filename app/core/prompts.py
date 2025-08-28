@@ -325,7 +325,19 @@ You will be given a single **factual claim** (e.g. from a rewritten sentence aft
 
 Your goal is to extract **atomic claims** that can each be verified independently.
 
----
+IMPORTANT RULES:
+1. Include specific temporal information (dates, times) when available
+2. Include specific geographical information (cities, states, countries)
+3. Include specific numerical information (ages, quantities)
+4. Include specific names and titles when mentioned
+5. Each sub-claim should be independently verifiable
+6. Avoid vague pronouns - use specific names/entities
+7. Preserve the original context and specificity
+
+EXAMPLE:
+Original: "The suspect shot dead two officers during a raid yesterday"
+Bad decomposition: "The suspect shot dead two officers"
+Good decomposition: "On August 26, 2025, a suspect shot dead two Victoria Police officers during a raid in Porepunkah, Victoria, Australia"
 
 A well-formed decomposed claim MUST:
 - Contain one discrete factual proposition

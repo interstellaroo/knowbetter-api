@@ -11,7 +11,7 @@ class ArticleData(BaseModel):
     publish_date: datetime
     summary: str
     paragraphs: List[str]
-
+    domain: str
 
 class SentenceData(BaseModel):
     index: int

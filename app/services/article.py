@@ -1,13 +1,16 @@
-import logging
 import spacy
 from newspaper import Article
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 import trafilatura
 from app.schemas.article import ArticleData, SentenceData, SplittingData, ArticleExtractionData
+from newspaper.exceptions import ArticleBinaryDataException
 from app.services.llm import select_sentences, disambiguate_sentences, decompose_sentences
+from app.services.retrieve import process_decomposition_evidence
+from app.services.verify import process_evidence_verification 
 import re
-
+from urllib.parse import urlparse
+import logging
 
 logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
@@ -129,6 +132,7 @@ def extract_article(url: str) -> ArticleData:
         article.nlp()
         
         paragraphs = get_paragraphs(url, article.html)
+        domain = get_domain(url)
         
         result = ArticleData(
             url=url,
@@ -138,13 +142,30 @@ def extract_article(url: str) -> ArticleData:
             publish_date=article.publish_date,
             summary=article.summary,
             paragraphs=paragraphs,
+            domain=domain
         )
         logger.info("Successfully extracted article from %s", url)
         return result
+    
+    except ArticleBinaryDataException as e:
+        raise
     except Exception as e:
-        logger.exception("Error extracting article from %s: %s", url, e)
         raise Exception(f"Article extraction failed: {e}")
 
+def get_domain(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        
+        if not domain:
+            raise ValueError("No domain found in the URL")
+        if domain.startswith("www."):
+            domain = domain[4:]
+            
+        return domain
+    except Exception as e:
+        logger.error("Failed to extract domain from URL %s: %s", url, e)
+        raise ValueError(f"Domain extraction error: {url}")
 
 async def create_processing_data(article_data: ArticleData) -> SplittingData:
     """Creates processing data for the article by splitting its paragraphs into sentences.
@@ -191,6 +212,7 @@ async def process_article(url: str) -> ArticleExtractionData:
         url (str): The URL of the article to process.
 
     Raises:
+        ArticleBinaryDataException: If the article contains binary data.
         Exception: If an error occurs while processing the article.
 
     Returns:
@@ -204,10 +226,12 @@ async def process_article(url: str) -> ArticleExtractionData:
             article=article,
             data=splitting_data
         )
-
+    except ArticleBinaryDataException:
+        logger.warning("Binary data detected in article from %s", url)
+        raise 
     except Exception as e:
         logger.exception("Error processing article from %s: %s", url, e)
-        raise Exception(f"Article processing failed: {e}")
+        raise Exception(f"Article processing failed")
 
 async def run_article_processing(url: str):
     try:
@@ -215,10 +239,46 @@ async def run_article_processing(url: str):
         logger.info("Extracted %d sentences from article", article_data.data.count)
         
         selection_results = await select_sentences(article_data.data)
+        verifiable_count = sum(1 for r in selection_results if r.verification_label != "not_verifiable")
+        logger.info(f"Selection complete: {verifiable_count}/{len(selection_results)} sentences marked as verifiable")
+        
         disambiguation_results = await disambiguate_sentences(selection_results, article_data.data)
+        logger.info(f"Disambiguation complete: {len(disambiguation_results)} sentences disambiguated")
+        
         decomposition_results = await decompose_sentences(disambiguation_results)
+        total_claims = sum(len(result.decomposed_claims) for result in decomposition_results)
+        logger.info(f"Decomposition complete: {len(decomposition_results)} sentences produced {total_claims} total claims")
+        
+        if decomposition_results and total_claims > 0:
+            evidence_results = await process_decomposition_evidence(decomposition_results, article_data.article.domain)
+            logger.info(f"Evidence retrieval complete: {len(evidence_results.evidence)} evidence results")
+            
+            # Verify claims against evidence
+            if evidence_results.evidence:
+                verification_results = await process_evidence_verification([evidence_results])
+                logger.info(f"Verification complete: {verification_results.total_processed} claims verified in {verification_results.processing_time:.2f}s")
+                return verification_results
+            else:
+                logger.warning("No evidence found for verification")
+                return evidence_results
+        else:
+            logger.warning("No claims found for evidence retrieval")
+            evidence_results = []
 
-        return decomposition_results
+        return evidence_results
+    except ArticleBinaryDataException:
+        logger.warning("Binary data detected during article processing for %s", url)
+        raise  # Re-raise to preserve exception type for route handler
     except Exception as e:
         logger.error(f"Error processing article: {str(e)}")
         raise Exception(f"Failed to process article: {str(e)}")
+
+async def get_article_summary(url: str):
+    try:
+        article = Article(url)
+        article.download()
+        article.nlp()
+        return article.summary()
+    except Exception as e:
+        logger.error(f"Error getting article summary: {str(e)}")
+        return None
